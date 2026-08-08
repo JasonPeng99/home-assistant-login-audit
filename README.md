@@ -7,6 +7,7 @@ Home Assistant Ingress 附加元件，用來查看登入成功與失敗紀錄。
 - 顯示登入使用者、時間、來源 IP 與 Client。
 - 保存登入失敗的來源 IP、User-Agent 與請求路徑。
 - 支援安全 IP／CIDR 標記。
+- 可在介面管理安全 IP 與稽核黑名單。
 - 僅允許 Home Assistant 管理員透過 Ingress 存取。
 - 不輸出或保存密碼、Refresh Token、Credential ID。
 

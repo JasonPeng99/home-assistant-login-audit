@@ -22,6 +22,7 @@ PORT = 8099
 AUTH_PATH = Path("/homeassistant/.storage/auth")
 OPTIONS_PATH = Path("/data/options.json")
 EVENTS_PATH = Path("/data/login_failures.jsonl")
+SETTINGS_PATH = Path("/data/ip_lists.json")
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 FAILURE_RE = re.compile(
     r"(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?)"
@@ -43,6 +44,50 @@ def load_options() -> dict[str, Any]:
     return defaults
 
 
+def validate_networks(values: Any) -> list[str]:
+    if not isinstance(values, list) or len(values) > 200:
+        raise ValueError("IP list must be an array with at most 200 entries")
+    result = []
+    for value in values:
+        text = str(value).strip()
+        if not text:
+            continue
+        try:
+            network = str(ipaddress.ip_network(text, strict=False))
+        except ValueError as exc:
+            raise ValueError(f"Invalid IP or CIDR: {text[:128]}") from exc
+        if network not in result:
+            result.append(network)
+    return result
+
+
+def load_ip_lists() -> dict[str, list[str]]:
+    try:
+        data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        return {
+            "safe_ips": validate_networks(data.get("safe_ips", [])),
+            "blacklist_ips": validate_networks(data.get("blacklist_ips", [])),
+        }
+    except FileNotFoundError:
+        # Import the existing app option once when upgrading from 0.1.x.
+        return {"safe_ips": validate_networks(load_options()["safe_ips"]), "blacklist_ips": []}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        print(f"IP list load failed: {type(exc).__name__}: {exc}", flush=True)
+        return {"safe_ips": [], "blacklist_ips": []}
+
+
+def save_ip_lists(safe_ips: Any, blacklist_ips: Any) -> dict[str, list[str]]:
+    data = {
+        "safe_ips": validate_networks(safe_ips),
+        "blacklist_ips": validate_networks(blacklist_ips),
+    }
+    SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary = SETTINGS_PATH.with_suffix(".tmp")
+    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(SETTINGS_PATH)
+    return data
+
+
 def normalize_ip(value: Any) -> str | None:
     if not value:
         return None
@@ -52,11 +97,11 @@ def normalize_ip(value: Any) -> str | None:
         return str(value).strip()[:128]
 
 
-def is_safe_ip(value: Any, safe_ips: list[str]) -> bool:
+def ip_in_list(value: Any, networks: list[str]) -> bool:
     normalized = normalize_ip(value)
     if not normalized:
         return False
-    for entry in safe_ips:
+    for entry in networks:
         try:
             if ipaddress.ip_address(normalized) in ipaddress.ip_network(entry, strict=False):
                 return True
@@ -64,6 +109,14 @@ def is_safe_ip(value: Any, safe_ips: list[str]) -> bool:
             if normalized == entry:
                 return True
     return False
+
+
+def classify_ip(value: Any, lists: dict[str, list[str]]) -> str:
+    if ip_in_list(value, lists["blacklist_ips"]):
+        return "blacklist"
+    if ip_in_list(value, lists["safe_ips"]):
+        return "safe"
+    return "unknown"
 
 
 def client_label(client_id: Any) -> str:
@@ -89,7 +142,7 @@ def admin_user_ids(data: dict[str, Any]) -> set[str]:
     }
 
 
-def successful_logins(data: dict[str, Any], safe_ips: list[str]) -> list[dict[str, Any]]:
+def successful_logins(data: dict[str, Any], lists: dict[str, list[str]]) -> list[dict[str, Any]]:
     users = {user["id"]: user for user in data.get("users", [])}
     rows = []
     for token in data.get("refresh_tokens", []):
@@ -104,7 +157,7 @@ def successful_logins(data: dict[str, Any], safe_ips: list[str]) -> list[dict[st
                 "created_at": token.get("created_at"),
                 "last_used_at": token.get("last_used_at"),
                 "ip": ip,
-                "safe": is_safe_ip(ip, safe_ips),
+                "classification": classify_ip(ip, lists),
                 "client": client_label(token.get("client_id")),
             }
         )
@@ -127,7 +180,7 @@ def supervisor_logs() -> str:
         return ""
 
 
-def parse_failures(log_text: str, safe_ips: list[str]) -> list[dict[str, Any]]:
+def parse_failures(log_text: str, lists: dict[str, list[str]]) -> list[dict[str, Any]]:
     rows = []
     for raw_line in ANSI_RE.sub("", log_text).splitlines():
         match = FAILURE_RE.search(raw_line)
@@ -140,7 +193,7 @@ def parse_failures(log_text: str, safe_ips: list[str]) -> list[dict[str, Any]]:
                 "status": "failure",
                 "timestamp": item["timestamp"],
                 "ip": ip,
-                "safe": is_safe_ip(ip, safe_ips),
+                "classification": classify_ip(ip, lists),
                 "host": item.get("host", "")[:300],
                 "url": item.get("url", "")[:500],
                 "agent": (item.get("agent") or "")[:1000],
@@ -190,18 +243,22 @@ def persist_failures(new_rows: list[dict[str, Any]], options: dict[str, Any]) ->
 
 def collect() -> dict[str, Any]:
     options = load_options()
+    lists = load_ip_lists()
     auth = load_auth()
-    failures = parse_failures(supervisor_logs(), options["safe_ips"])
+    failures = parse_failures(supervisor_logs(), lists)
     failures = persist_failures(failures, options)
+    for failure in failures:
+        failure["classification"] = classify_ip(failure.get("ip"), lists)
+        failure.pop("safe", None)
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "successes": successful_logins(auth, options["safe_ips"]),
+        "successes": successful_logins(auth, lists),
         "failures": failures,
-        "safe_ips": options["safe_ips"],
+        **lists,
     }
 
 
-INDEX = """<!doctype html><html lang=\"zh-Hant\"><head><meta charset=\"utf-8\">
+INDEX_FALLBACK = """<!doctype html><html lang=\"zh-Hant\"><head><meta charset=\"utf-8\">
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>HA 登入稽核</title>
 <style>
 :root{color-scheme:light dark;--bg:#f4f6f8;--card:#fff;--text:#18212b;--muted:#617080;--line:#dce2e8;--ok:#16803d;--bad:#bd2c2c;--safe:#e6f6ec;--warn:#fff0ee} @media(prefers-color-scheme:dark){:root{--bg:#101418;--card:#1b2229;--text:#edf2f7;--muted:#a8b4c0;--line:#34404b;--safe:#143824;--warn:#492020}}
@@ -219,6 +276,10 @@ function showTab(id,b){document.querySelectorAll('.table-wrap').forEach(x=>x.cla
 async function loadAudit(){document.getElementById('error').textContent='';try{const r=await fetch('api/audit',{cache:'no-store'});if(!r.ok)throw new Error(await r.text());const d=await r.json();successCount.textContent=d.successes.length;failureCount.textContent=d.failures.length;unsafeCount.textContent=d.failures.filter(x=>!x.safe).length;updated.textContent='更新：'+time(d.generated_at)+'｜安全 IP：'+d.safe_ips.join(', ');document.querySelector('#failure tbody').innerHTML=d.failures.map(x=>`<tr class=\"${x.safe?'safe':'unsafe'}\"><td>${time(x.timestamp)}</td><td>${esc(x.ip)}</td><td>${badge(x.safe)}</td><td class=\"agent\" title=\"${esc(x.agent)}\">${esc(x.agent||'—')}</td><td>${esc(x.url)}</td></tr>`).join('')||'<tr><td colspan=\"5\">目前沒有失敗紀錄</td></tr>';document.querySelector('#success tbody').innerHTML=d.successes.map(x=>`<tr class=\"${x.safe?'safe':''}\"><td>${time(x.created_at)}</td><td>${esc(x.user)}</td><td>${time(x.last_used_at)}</td><td>${esc(x.ip||'—')}</td><td>${badge(x.safe)}</td><td>${esc(x.client)}</td></tr>`).join('')||'<tr><td colspan=\"6\">目前沒有成功紀錄</td></tr>'}catch(e){document.getElementById('error').textContent='載入失敗：'+e.message}}
 loadAudit();setInterval(loadAudit,60000);
 </script></main></body></html>"""
+try:
+    INDEX = Path("/app/index.html").read_text(encoding="utf-8")
+except OSError:
+    INDEX = INDEX_FALLBACK
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -260,12 +321,30 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_body(200, INDEX.encode(), "text/html; charset=utf-8")
 
+    def do_POST(self) -> None:
+        if not self.ingress_admin():
+            self.send_body(403, "僅限 Home Assistant 管理員使用".encode(), "text/plain; charset=utf-8")
+            return
+        path = self.path.split("?", 1)[0].rstrip("/")
+        if not (path.endswith("/api/settings") or path == "/api/settings"):
+            self.send_body(404, b'{"error":"not found"}', "application/json")
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length < 1 or length > 32768:
+                raise ValueError("Invalid request size")
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            result = save_ip_lists(payload.get("safe_ips"), payload.get("blacklist_ips"))
+            self.send_body(200, json.dumps(result, ensure_ascii=False).encode(), "application/json; charset=utf-8")
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            self.send_body(400, json.dumps({"error": str(exc)}, ensure_ascii=False).encode(), "application/json; charset=utf-8")
+
 
 def poll_forever() -> None:
     while True:
         try:
             options = load_options()
-            persist_failures(parse_failures(supervisor_logs(), options["safe_ips"]), options)
+            persist_failures(parse_failures(supervisor_logs(), load_ip_lists()), options)
         except Exception as exc:
             print(f"background audit failed: {type(exc).__name__}: {exc}", flush=True)
         time.sleep(15)
