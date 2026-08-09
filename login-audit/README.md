@@ -14,7 +14,9 @@
 
 - 管理員可直接在 Ingress 介面新增或移除安全 IP 與黑名單。
 - 支援 IPv4、IPv6 與 CIDR，最多各 200 筆。
-- 黑名單用於稽核分類與醒目警示，不會直接修改 Home Assistant 防火牆或封鎖網路。
+- 單一 IP 黑名單會同步到 Home Assistant `ip_bans.yaml`；管理員按下「套用並重啟 HA」後開始封鎖。
+- CIDR 不受 Home Assistant IP Ban 支援，因此只作稽核分類與醒目警示。
+- 移除黑名單時，只會移除本附加元件加入的封鎖，不會刪除 HA 自動建立的封鎖。
 - 名單保存在 `/data/ip_lists.json`，重新啟動及升級後仍會保留。
 
 ## 選項

@@ -23,6 +23,9 @@ AUTH_PATH = Path("/homeassistant/.storage/auth")
 OPTIONS_PATH = Path("/data/options.json")
 EVENTS_PATH = Path("/data/login_failures.jsonl")
 SETTINGS_PATH = Path("/data/ip_lists.json")
+MANAGED_BANS_PATH = Path("/data/managed_ip_bans.json")
+RESTART_REQUIRED_PATH = Path("/data/ip_ban_restart_required")
+IP_BANS_PATH = Path("/homeassistant/ip_bans.yaml")
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 FAILURE_RE = re.compile(
     r"(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?)"
@@ -31,6 +34,7 @@ FAILURE_RE = re.compile(
     r"(?: \((?P<agent>.*)\))?"
 )
 LOCK = threading.Lock()
+BAN_LOCK = threading.Lock()
 
 
 def load_options() -> dict[str, Any]:
@@ -85,7 +89,111 @@ def save_ip_lists(safe_ips: Any, blacklist_ips: Any) -> dict[str, list[str]]:
     temporary = SETTINGS_PATH.with_suffix(".tmp")
     temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     temporary.replace(SETTINGS_PATH)
+    sync_ip_bans(data["blacklist_ips"])
     return data
+
+
+def exact_address(network: str) -> str | None:
+    value = ipaddress.ip_network(network, strict=False)
+    if value.prefixlen != value.max_prefixlen:
+        return None
+    return str(value.network_address)
+
+
+def load_managed_bans() -> set[str]:
+    try:
+        value = json.loads(MANAGED_BANS_PATH.read_text(encoding="utf-8"))
+        return {str(ipaddress.ip_address(item)) for item in value if isinstance(item, str)}
+    except (OSError, ValueError, TypeError):
+        return set()
+
+
+def split_ban_blocks(raw: str) -> tuple[list[str], list[tuple[str | None, list[str]]]]:
+    preamble: list[str] = []
+    blocks: list[tuple[str | None, list[str]]] = []
+    current: list[str] = []
+    current_ip: str | None = None
+    top_level = re.compile(r"^([^\s#][^:]*):\s*(?:#.*)?$")
+    for line in raw.splitlines(keepends=True):
+        match = top_level.match(line.rstrip("\r\n"))
+        if match:
+            if current:
+                blocks.append((current_ip, current))
+            key = match.group(1).strip().strip("'\"")
+            try:
+                current_ip = str(ipaddress.ip_address(key))
+            except ValueError:
+                current_ip = None
+            current = [line]
+        elif current:
+            current.append(line)
+        else:
+            preamble.append(line)
+    if current:
+        blocks.append((current_ip, current))
+    return preamble, blocks
+
+
+def sync_ip_bans(blacklist_ips: list[str]) -> dict[str, Any]:
+    desired = {address for item in blacklist_ips if (address := exact_address(item))}
+    with BAN_LOCK:
+        managed = load_managed_bans()
+        try:
+            raw = IP_BANS_PATH.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            raw = ""
+        preamble, blocks = split_ban_blocks(raw)
+        existing = {address for address, _ in blocks if address}
+        retained = [(address, lines) for address, lines in blocks if not (address in managed and address not in desired)]
+        retained_ips = {address for address, _ in retained if address}
+        newly_managed = (managed & desired) | (desired - existing)
+        now = datetime.now(timezone.utc).isoformat()
+        for address in sorted(desired - retained_ips, key=lambda value: ipaddress.ip_address(value)):
+            retained.append((address, [f"{address}:\n", f"  banned_at: '{now}'\n"]))
+        output = "".join(preamble)
+        if output and not output.endswith("\n"):
+            output += "\n"
+        output += "".join("".join(lines) for _, lines in retained)
+        if output and not output.endswith("\n"):
+            output += "\n"
+        changed = output != raw
+        if changed:
+            IP_BANS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            temporary = IP_BANS_PATH.with_suffix(".yaml.login-audit.tmp")
+            temporary.write_text(output, encoding="utf-8")
+            temporary.replace(IP_BANS_PATH)
+            RESTART_REQUIRED_PATH.write_text("1\n", encoding="ascii")
+        MANAGED_BANS_PATH.write_text(json.dumps(sorted(newly_managed), indent=2) + "\n", encoding="utf-8")
+        return ip_ban_status(blacklist_ips)
+
+
+def ip_ban_status(blacklist_ips: list[str] | None = None) -> dict[str, Any]:
+    if blacklist_ips is None:
+        blacklist_ips = load_ip_lists()["blacklist_ips"]
+    exact = [address for item in blacklist_ips if (address := exact_address(item))]
+    cidrs = [item for item in blacklist_ips if exact_address(item) is None]
+    return {
+        "managed_ips": sorted(load_managed_bans()),
+        "exact_blacklist_ips": sorted(exact),
+        "audit_only_cidrs": cidrs,
+        "restart_required": RESTART_REQUIRED_PATH.exists(),
+    }
+
+
+def request_core_restart() -> None:
+    token = os.environ.get("SUPERVISOR_TOKEN", "")
+    if not token:
+        raise RuntimeError("Supervisor token unavailable")
+    request = urllib.request.Request(
+        "http://supervisor/core/restart",
+        data=b"{}",
+        method="POST",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        if response.status >= 300:
+            raise RuntimeError(f"Supervisor restart failed: HTTP {response.status}")
+    RESTART_REQUIRED_PATH.unlink(missing_ok=True)
 
 
 def normalize_ip(value: Any) -> str | None:
@@ -255,6 +363,7 @@ def collect() -> dict[str, Any]:
         "successes": successful_logins(auth, lists),
         "failures": failures,
         **lists,
+        "ip_ban_sync": ip_ban_status(lists["blacklist_ips"]),
     }
 
 
@@ -326,6 +435,14 @@ class Handler(BaseHTTPRequestHandler):
             self.send_body(403, "僅限 Home Assistant 管理員使用".encode(), "text/plain; charset=utf-8")
             return
         path = self.path.split("?", 1)[0].rstrip("/")
+        if path.endswith("/api/restart") or path == "/api/restart":
+            try:
+                request_core_restart()
+                self.send_body(202, b'{"accepted":true}', "application/json")
+            except (RuntimeError, urllib.error.URLError, TimeoutError, OSError) as exc:
+                print(f"Core restart request failed: {type(exc).__name__}: {exc}", flush=True)
+                self.send_body(500, b'{"error":"core restart request failed"}', "application/json")
+            return
         if not (path.endswith("/api/settings") or path == "/api/settings"):
             self.send_body(404, b'{"error":"not found"}', "application/json")
             return
@@ -338,6 +455,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_body(200, json.dumps(result, ensure_ascii=False).encode(), "application/json; charset=utf-8")
         except (ValueError, TypeError, json.JSONDecodeError) as exc:
             self.send_body(400, json.dumps({"error": str(exc)}, ensure_ascii=False).encode(), "application/json; charset=utf-8")
+        except OSError as exc:
+            print(f"IP ban sync failed: {type(exc).__name__}: {exc}", flush=True)
+            self.send_body(500, b'{"error":"IP ban sync failed"}', "application/json")
 
 
 def poll_forever() -> None:

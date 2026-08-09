@@ -1,5 +1,5 @@
 name: HA 登入稽核
-version: "0.2.0"
+version: "0.3.0"
 slug: login_audit
 description: 以唯讀方式顯示 Home Assistant 使用者登入成功與失敗紀錄
 url: https://github.com/JasonPeng99/home-assistant-login-audit
@@ -14,10 +14,11 @@ panel_admin: true
 panel_icon: mdi:account-lock-outline
 panel_title: 登入稽核
 hassio_api: true
+hassio_role: homeassistant
 homeassistant_api: false
 map:
   - type: homeassistant_config
-    read_only: true
+    read_only: false
 options:
   safe_ips: []
   retention_days: 90

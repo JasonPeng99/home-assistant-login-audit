@@ -1,4 +1,6 @@
 import importlib.util
+import json
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -36,6 +38,30 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(["192.168.1.0/24"], APP.validate_networks(["192.168.1.18/24", "192.168.1.0/24"]))
         with self.assertRaises(ValueError):
             APP.validate_networks(["not-an-ip"])
+
+    def test_ip_ban_sync_preserves_unmanaged_and_removes_only_managed(self):
+        original = (APP.IP_BANS_PATH, APP.MANAGED_BANS_PATH, APP.RESTART_REQUIRED_PATH)
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            APP.IP_BANS_PATH = base / "ip_bans.yaml"
+            APP.MANAGED_BANS_PATH = base / "managed.json"
+            APP.RESTART_REQUIRED_PATH = base / "restart"
+            APP.IP_BANS_PATH.write_text(
+                "198.51.100.1:\n  banned_at: '2026-08-01T00:00:00+00:00'\n"
+                "203.0.113.10:\n  banned_at: '2026-08-02T00:00:00+00:00'\n",
+                encoding="utf-8",
+            )
+            APP.MANAGED_BANS_PATH.write_text(json.dumps(["203.0.113.10"]), encoding="utf-8")
+            try:
+                status = APP.sync_ip_bans(["203.0.113.11/32", "192.0.2.0/24"])
+                content = APP.IP_BANS_PATH.read_text(encoding="utf-8")
+                self.assertIn("198.51.100.1:", content)
+                self.assertNotIn("203.0.113.10:", content)
+                self.assertIn("203.0.113.11:", content)
+                self.assertEqual(["192.0.2.0/24"], status["audit_only_cidrs"])
+                self.assertTrue(status["restart_required"])
+            finally:
+                APP.IP_BANS_PATH, APP.MANAGED_BANS_PATH, APP.RESTART_REQUIRED_PATH = original
 
     def test_success_never_exposes_token_fields(self):
         data = {
